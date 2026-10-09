@@ -1,0 +1,7 @@
+# Force light theme: the custom light backgrounds made dark-mode (white) text invisible
+[theme]
+base = "light"
+primaryColor = "#e63946"
+backgroundColor = "#f5f0e8"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1d2433"

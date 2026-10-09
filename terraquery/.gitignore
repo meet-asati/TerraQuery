@@ -1,0 +1,11 @@
+.env
+models/*.pt
+models/*.zip
+data/tiles/
+data/*.faiss
+data/*.gpkg
+data/tile_index.json
+__pycache__/
+*.pyc
+*.pth
+.venv/
