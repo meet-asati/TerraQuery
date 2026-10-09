@@ -50,4 +50,43 @@ def parse_query(user_query: str) -> dict:
             "task": "search"
         }
 
-__all__ = ["parse_query"]
+EXPLAIN_PROMPT = """You explain why a satellite-image search selected each area in Mumbai.
+For each area you get computed facts (rank, similarity strength, which cue matched,
+OpenStreetMap buildings/roads). Write ONE plain sentence (max 25 words) per area saying
+why it was selected for the user's query.
+- Lead with what the imagery shows that fits the query, then add the most distinctive
+  context for THAT area: named places, nearby roads, or notable building types.
+- Do not start with "This area was selected"; vary wording between areas.
+- Mention building counts only when notable (e.g. none mapped, or mostly industrial).
+- Use ONLY the given facts; never invent features. If the match is only "moderately",
+  say the match is weaker.
+Return JSON: {"reasons": [{"rank": 1, "reason": "..."}]} with one entry per area."""
+
+def explain_tiles(user_query: str, parsed: dict, tiles) -> list:
+    """One GPT sentence per matched tile; falls back to the computed facts string."""
+    facts = list(tiles["facts"]) if "facts" in tiles.columns else [""] * len(tiles)
+    if not len(tiles):
+        return []
+    payload = {
+        "query": user_query,
+        "visual_description": parsed.get("visual_description"),
+        "areas": [{"rank": int(r), "facts": f} for r, f in zip(tiles["rank"], facts)],
+    }
+    try:
+        response = client.with_options(timeout=10, max_retries=0).chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": EXPLAIN_PROMPT},
+                {"role": "user", "content": json.dumps(payload)}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+        by_rank = {int(x["rank"]): str(x["reason"]).strip()
+                   for x in json.loads(response.choices[0].message.content)["reasons"]}
+        return [by_rank.get(int(r)) or f for r, f in zip(tiles["rank"], facts)]
+    except Exception as e:
+        print(f"[parser] explain call failed, using facts: {e}")
+        return facts
+
+__all__ = ["parse_query", "explain_tiles"]

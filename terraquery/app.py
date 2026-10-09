@@ -1,9 +1,10 @@
+import html
 import streamlit as st
 # folium backend: the default ipyleaflet widget renders blank inside Streamlit
 import leafmap.foliumap as leafmap
 from config import AOI_CENTER
 from pipeline import load_models, search_with_tiles
-from parser import parse_query
+from parser import parse_query, explain_tiles
 
 st.set_page_config(layout="wide", page_title="TerraQuery AI")
 
@@ -19,6 +20,8 @@ header[data-testid="stHeader"] { display: none; }
 .tq-item { padding: 6px 0; border-bottom: 1px solid #e3e6ee; font-size: 0.9rem; }
 .tq-item code { font-size: 0.8rem; }
 .tq-summary { font-size: 0.95rem; margin: 2px 0 6px; }
+.tq-why { margin-top: 3px; line-height: 1.35; }
+.tq-facts { margin-top: 2px; font-size: 0.78rem; color: #6b7280; line-height: 1.3; }
 </style>""", unsafe_allow_html=True)
 
 # Session state
@@ -65,8 +68,10 @@ with panel:
     if query:
         with st.spinner("Searching satellite imagery..."):
             parsed = parse_query(query)
-            st.session_state.results_gdf, st.session_state.tiles_gdf = search_with_tiles(
-                query, top_k=10, parsed=parsed)
+            results_gdf, tiles_gdf = search_with_tiles(query, top_k=10, parsed=parsed)
+            if not tiles_gdf.empty:
+                tiles_gdf["reason"] = explain_tiles(query, parsed, tiles_gdf)
+            st.session_state.results_gdf, st.session_state.tiles_gdf = results_gdf, tiles_gdf
             st.session_state.last_parsed = parsed
             st.session_state.query_history.append(query)
 
@@ -88,8 +93,10 @@ with panel:
             unsafe_allow_html=True)
         items = "".join(
             f"<div class='tq-item'><b>#{t['rank']}</b> · score <code>{t['score']:.3f}</code> · "
-            f"{t['n_features']} features<br><code>{t.geometry.centroid.y:.5f}, "
-            f"{t.geometry.centroid.x:.5f}</code></div>"
+            f"{t['n_features']} features · <code>{t.geometry.centroid.y:.5f}, "
+            f"{t.geometry.centroid.x:.5f}</code>"
+            f"<div class='tq-why'>💡 {html.escape(str(t.get('reason', '')))}</div>"
+            f"<div class='tq-facts'>{html.escape(str(t.get('facts', '')))}</div></div>"
             for _, t in tiles.iterrows())
         st.markdown(f"<div class='tq-list'>{items}</div>", unsafe_allow_html=True)
         # Export only the matched locations (ranked tiles) with readable details
@@ -100,6 +107,9 @@ with panel:
         export["center_lat"] = ((bounds.miny + bounds.maxy) / 2).round(6)
         export["center_lon"] = ((bounds.minx + bounds.maxx) / 2).round(6)
         export = export.rename(columns={"n_features": "buildings_in_area"})
+        for col in ("reason", "facts", "building_mix", "named_places", "roads"):
+            if col in tiles.columns:
+                export[col] = tiles[col].values
         st.download_button("⬇ Download GeoJSON", export.to_json(), "results.geojson",
                            "application/json", use_container_width=True)
 
@@ -114,7 +124,8 @@ with map_slot:
                          "weight":1,"fillOpacity":0.35})
     if tiles is not None and not tiles.empty:
         # Matched tiles: what the visual search found, ranked by similarity
-        m.add_gdf(tiles[["rank", "score", "n_features", "geometry"]], layer_name="Matched tiles",
+        tip_cols = [c for c in ("rank", "score", "n_features", "reason", "geometry") if c in tiles.columns]
+        m.add_gdf(tiles[tip_cols], layer_name="Matched tiles",
                   style={"color":"#ffd60a","fillColor":"#ffd60a",
                          "weight":3,"fillOpacity":0.08})
         b = tiles.total_bounds
