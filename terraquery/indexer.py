@@ -173,6 +173,33 @@ def download_osm_landcover(bbox=AOI_BBOX):
     lc = gpd.GeoDataFrame(lc[keep + ["geometry"]], geometry="geometry", crs=lc.crs)
     lc.to_file(OSM_LANDCOVER, driver="GPKG")
     print(f"Downloaded {len(lc)} land-cover / water features")
+    download_osm_infrastructure(bbox)
+
+# Railway tracks (lines, not stations) and power infrastructure (incl. solar generators)
+INFRA_TAGS = {"railway": ["rail", "light_rail", "subway", "monorail", "narrow_gauge", "tram",
+                          "construction"],
+              "power": True}
+INFRA_COLUMNS = ("name", "name:en", "railway", "usage", "service", "electrified", "tunnel",
+                 "bridge", "operator", "construction", "power", "generator:source",
+                 "generator:method", "generator:type", "generator:output:electricity",
+                 "plant:source", "plant:output:electricity", "location", "voltage")
+
+def download_osm_infrastructure(bbox=AOI_BBOX):
+    for endpoint in OVERPASS_ENDPOINTS:
+        ox.settings.overpass_endpoint = endpoint
+        try:
+            infra = ox.features_from_bbox(*bbox, tags=INFRA_TAGS)
+            break
+        except Exception as e:
+            print(f"[WARNING] Overpass endpoint {endpoint} failed for infrastructure: {e}")
+    else:
+        print("[WARNING] Infrastructure download failed — keeping existing data (if any)")
+        return
+    infra = infra.reset_index()
+    keep = [c for c in ("element_type", "osmid", *INFRA_COLUMNS) if c in infra.columns]
+    infra = gpd.GeoDataFrame(infra[keep + ["geometry"]], geometry="geometry", crs=infra.crs)
+    infra.to_file(OSM_INFRA, driver="GPKG")
+    print(f"Downloaded {len(infra)} railway / power features")
 
 def demo_mode():
     os.makedirs(TILE_DIR, exist_ok=True)

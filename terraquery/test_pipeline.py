@@ -68,4 +68,26 @@ p9, r9 = run("schools within 200 m of water bodies")
 assert p9.get("spatial_relation") and len(r9)
 assert (r9["dist_m"] <= 200).all() and r9["matched_tag"].str.contains("school").all()
 assert int(r9["total_matches"].iloc[0]) < 149   # fewer than all schools
+# 10. Specific water type: "river" measures only against rivers, not ponds/drains/creeks
+p10, r10 = run("schools near river")
+assert len(r10) and set(r10["target_tag"].astype(str)) <= {"waterway=river", "water=river"}
+assert set(r10["target_name"].dropna()) <= {"Mithi River", "Danda Creek"}
+
+# 11. Ponds: never measured against rivers or drains
+p11, r11 = run("schools within 200 m of ponds")
+assert not set(r11.get("target_tag", [])) & {"waterway=river", "water=river", "waterway=drain"}
+
+# 12. Water as a main category: one result per named river (segments merged)
+p12, r12 = run("show me rivers")
+assert len(r12) and r12["name"].dropna().is_unique and "Mithi River" in set(r12["name"])
+# 13. Railway tracks: only the actual track lines from the railway layer (no points/buildings)
+p13, r13 = run("railway tracks")
+assert len(r13) and (r13["layer"] == "infra").all()
+assert set(r13.geometry.geom_type) <= {"LineString", "MultiLineString"}
+assert r13["name"].astype(str).str.contains("Western Railway|Central Railway").any()
+
+# 14. Solar panels use OSM power tags; none are mapped here -> empty + note, never look-alikes
+p14, r14 = run("solar panels")
+assert "generator:source" in (p14.get("osm_tags") or {})
+assert len(r14) == 0 and "No OpenStreetMap features tagged" in r14.attrs.get("note", "")
 print("\nAll checks passed.")

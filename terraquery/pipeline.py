@@ -48,6 +48,7 @@ def _load_models():
     _load_roads()
     _load_pois()
     _load_landcover()
+    _load_infra()
     _load_building_index()
     print("Models loaded." if _model is not None else "Running without SkyCLIP model.")
 
@@ -58,7 +59,12 @@ CATEGORY_LIMIT = 50          # max features listed for a category query ("hospit
 QUALIFIER_KEYS = {"religion", "denomination", "sport", "cuisine", "operator", "station"}
 METRIC_CRS = "EPSG:32643"     # UTM 43N (Mumbai): distances in metres
 DEFAULT_NEAR_M = 500
+WATER_KEYS = {"natural", "water", "waterway", "name~"}   # tags that need the land-cover layer
+# tags that need the railway/power layer (railway=station/halt stay in the POI layer)
+POWER_KEYS = {"power", "generator:source", "generator:method", "plant:source"}
+STATION_VALUES = {"station", "halt"}
 _landcover = None
+_infra = None
 # Per-building embeddings (build_building_index.py): FAISS index, embedding->building row,
 # building row->embedding, and the raw normalized vectors for whole-area statistics
 _bld_index = _bld_rows = _row_to_emb = _bld_emb = None
@@ -106,6 +112,27 @@ def _tag_match(gdf: gpd.GeoDataFrame, tags: dict):
     matched = pd.Series("", index=gdf.index, dtype="object")
     by_building = pd.Series(False, index=gdf.index)
     for k, v in tags.items():
+        if k == "name~":
+            # Name substrings as one more alternative: "creek" or "talao" have no OSM tag of
+            # their own (Danda Creek is water=river, many ponds carry only a name)
+            name_cols = [c for c in NAME_COLS if c in gdf.columns]
+            if not name_cols:
+                continue
+            names = gdf[name_cols].astype("string").apply(lambda c: c.str.lower())
+            # Only water features: "Lake View Apartments" / "Tank Road" are not water bodies
+            is_water = pd.Series(False, index=gdf.index)
+            for wk in ("water", "waterway"):
+                if wk in gdf.columns:
+                    is_water |= gdf[wk].notna()
+            if "natural" in gdf.columns:
+                is_water |= gdf["natural"].isin(["water", "wetland", "bay", "coastline"])
+            for sub in (str(x).lower() for x in _as_list(v)):
+                hit = is_water & names.apply(
+                    lambda c: c.str.contains(sub, regex=False, na=False)).any(axis=1)
+                new = hit & ~mask
+                matched[new] = "name~" + sub
+                mask |= hit
+            continue
         if k in QUALIFIER_KEYS or k not in gdf.columns:
             continue
         col = gdf[k]
@@ -155,6 +182,53 @@ def _dissolve_roads(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     merged["_named"] = merged["name"].notna() if "name" in merged.columns else False
     return merged.sort_values(["_named", "_len"], ascending=False).drop(columns=["_len", "_named"])
 
+def _load_infra() -> gpd.GeoDataFrame:
+    global _infra
+    if _infra is None:
+        try:
+            g = gpd.read_file(OSM_INFRA)
+            _infra = g.set_crs("EPSG:4326") if g.crs is None else g.to_crs("EPSG:4326")
+        except Exception as e:
+            print(f"[WARNING] Could not load railway/power data from {OSM_INFRA} ({e}) - run "
+                  "`python -c \"from indexer import download_osm_infrastructure; "
+                  "download_osm_infrastructure()\"`")
+            return gpd.GeoDataFrame()
+    return _infra
+
+def _needs_infra(tags: dict) -> bool:
+    if any(k in POWER_KEYS for k in tags):
+        return True
+    rail = tags.get("railway")
+    return rail is not None and not set(map(str, _as_list(rail))) <= STATION_VALUES
+
+def _merge_lines(results: gpd.GeoDataFrame, layers=("landcover", "infra")) -> gpd.GeoDataFrame:
+    """Features mapped in pieces (river segments, track segments): one result per named
+    feature; unnamed track pieces grouped by type ('Unnamed rail (yard)')."""
+    sel = results["layer"].isin(layers)
+    named = results[sel & results["name"].notna()]
+    unnamed_lines = results[sel & results["name"].isna() & results.get(
+        "railway", pd.Series(index=results.index, dtype="object")).notna()
+        & results.geometry.geom_type.isin(["LineString", "MultiLineString"])]
+    pieces = []
+    if len(named) > 1:
+        agg = {c: "first" for c in named.columns if c not in ("geometry", "name")}
+        pieces.append(named.dissolve(by="name", aggfunc=agg, as_index=False))
+    else:
+        pieces.append(named)
+    if len(unnamed_lines):
+        u = unnamed_lines.copy()
+        svc = u["service"] if "service" in u.columns else pd.Series(None, index=u.index)
+        u["group_label"] = ("Unnamed " + u["railway"].astype(str).str.replace("_", " ")
+                            + svc.map(lambda x: f" ({x})" if isinstance(x, str) else ""))
+        agg = {c: "first" for c in u.columns if c not in ("geometry", "group_label")}
+        pieces.append(u.dissolve(by="group_label", aggfunc=agg, as_index=False))
+    rest = results.drop(index=named.index.union(unnamed_lines.index))
+    merged = gpd.GeoDataFrame(pd.concat([rest, *pieces], ignore_index=True),
+                              geometry="geometry", crs="EPSG:4326")
+    # Longest first among line features so main lines lead the list
+    merged["_len"] = merged.to_crs(METRIC_CRS).length
+    return merged
+
 def _load_landcover() -> gpd.GeoDataFrame:
     global _landcover
     if _landcover is None:
@@ -171,7 +245,8 @@ def _find_targets(tags: dict) -> gpd.GeoDataFrame:
     """Every OSM feature (any layer) carrying the target tags of a spatial relation."""
     parts = []
     for layer, gdf in (("building", _load_buildings()), ("poi", _load_pois()),
-                       ("road", _load_roads()), ("landcover", _load_landcover())):
+                       ("road", _load_roads()), ("landcover", _load_landcover()),
+                       ("infra", _load_infra())):
         if gdf.empty:
             continue
         mask, matched = _tag_match(gdf, tags)
@@ -238,6 +313,13 @@ def osm_category_search(user_query, parsed, text_feat, tile_scores, top_k=CATEGO
     parts = []
     layers = (("road", _load_roads()),) if is_road else \
         (("building", _load_buildings()), ("poi", _load_pois()))
+    if not is_road and any(k in WATER_KEYS for k in tags):
+        # "show rivers" / "ponds": water lives in the land-cover layer; other categories
+        # keep searching buildings + POIs only
+        layers = layers + (("landcover", _load_landcover()),)
+    if not is_road and _needs_infra(tags):
+        # railway tracks / power: line and generator features live in the infra layer
+        layers = layers + (("infra", _load_infra()),)
     for layer, gdf in layers:
         if gdf.empty:
             continue
@@ -259,14 +341,22 @@ def osm_category_search(user_query, parsed, text_feat, tile_scores, top_k=CATEGO
     if is_road:
         results = _dissolve_roads(results)
     else:
+        # Rivers / tracks mapped in pieces: one result per named feature
+        has_lines = results["layer"].isin(["landcover", "infra"]).any()
+        if has_lines:
+            results = _merge_lines(results)
         results = _dedupe(results)
         # Points/POIs without a crop embedding: use the score of the tile they sit in
         cen = results.geometry.representative_point()
         tile_s = pd.Series([tile_scores.get(_tile_id_at(c.x, c.y), np.nan) for c in cen],
                            index=results.index)
         results["score"] = results["score"].fillna(tile_s) if "score" in results.columns else tile_s
-        results = results.assign(_named=results["name"].notna()).sort_values(
-            ["_named", "score"], ascending=[False, False]).drop(columns="_named")
+        if has_lines and "_len" in results.columns:   # tracks/rivers: named, then longest
+            results = results.assign(_named=results["name"].notna()).sort_values(
+                ["_named", "_len"], ascending=[False, False]).drop(columns=["_named", "_len"])
+        else:
+            results = results.assign(_named=results["name"].notna()).sort_values(
+                ["_named", "score"], ascending=[False, False]).drop(columns="_named")
     note, targets = "", None
     if rel:
         results, note, targets = _apply_spatial(results, rel)
@@ -448,6 +538,7 @@ def _load_buildings() -> gpd.GeoDataFrame:
             # Keep only useful columns; the raw OSM export has ~180 sparse tag columns
             keep = [c for c in ("building", "amenity", "healthcare", "leisure", "religion", "shop",
                                 "tourism", "office", "landuse", "power", "solar_panel",
+                                "roof:material",
                                 *NAME_COLS, "geometry") if c in b.columns]
             _buildings = b[keep]
             _buildings.sindex  # build spatial index once
@@ -636,9 +727,13 @@ def search_with_tiles(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict 
                        if 0 <= i < len(tiles)}
         found = osm_category_search(user_query, {**parsed, "osm_tags": tags}, text_feat,
                                     tile_scores)
-        if not found.attrs.get("no_tag_match"):
-            return found, gpd.GeoDataFrame()     # may be empty after a spatial filter: say so
-        print(f"[pipeline] no OSM features tagged {tags}; falling back to visual search")
+        if found.attrs.get("no_tag_match"):
+            # The category is defined by OSM tags: if nothing carries them, say so instead
+            # of returning look-alike buildings from image matching
+            tag_txt = ", ".join(f"{k}={'/'.join(map(str, _as_list(v)))}" for k, v in tags.items())
+            found.attrs["note"] = (f"No OpenStreetMap features tagged {tag_txt} are mapped in "
+                                   "Kurla–Bandra, so there is nothing to show for this query.")
+        return found, gpd.GeoDataFrame()     # may be empty after a spatial filter: say so
     if _bld_index is not None:
         return (_feature_search(user_query, parsed, text_feat, feats, top_k, tile_rank),
                 gpd.GeoDataFrame())

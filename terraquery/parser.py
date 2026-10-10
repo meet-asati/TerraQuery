@@ -23,8 +23,9 @@ Return ONLY valid JSON with exactly these fields:
 Rules:
 - osm_tags: the OSM tags that identify WHAT the user asks for. Values are a string,
   a list of strings (any of them), or "*" (any value). Several keys mean "any of these".
-  Use {} when the query is about APPEARANCE only (roof colour/material, density, slums,
-  tin roofs, solar panels, shadows, construction sites) - those are found visually.
+  Use {} when the query is about APPEARANCE only (roof colour, density, slums, tin roofs,
+  shadows, construction sites) - those are found visually. Anything OSM has a tag for
+  (solar panels, railway tracks, power lines...) MUST use the tag, never {}.
   NEVER default to {"building": "yes"}.
   Examples:
     hospitals -> {"amenity": "hospital", "healthcare": "hospital", "building": "hospital"}
@@ -37,11 +38,21 @@ Rules:
     churches -> {"amenity": "place_of_worship", "religion": "christian", "building": "church"}
     places of worship -> {"amenity": "place_of_worship"}
     parks / gardens -> {"leisure": ["park", "garden"]}
+    rivers / ponds / lakes / creeks / water bodies -> the same water tags as the
+      spatial-relation target examples below (most specific type the user named)
     playgrounds / sports grounds -> {"leisure": ["playground", "pitch", "sports_centre", "stadium"]}
     railway / train / local stations -> {"railway": ["station", "halt"],
                                          "station": ["!subway", "!monorail", "!light_rail"]}
     metro stations -> {"railway": "station", "station": "subway"}
     monorail stations -> {"railway": "station", "station": "monorail"}
+    railway tracks / railway lines / train lines -> {"railway": ["rail", "narrow_gauge"]}
+    metro lines -> {"railway": "subway"}
+    monorail line -> {"railway": "monorail"}
+    solar panels / solar plants / rooftop solar ->
+      {"generator:source": "solar", "plant:source": "solar", "roof:material": "solar_panels"}
+    power plants / generators -> {"power": ["plant", "generator"]}
+    substations -> {"power": "substation"}
+    power lines / transmission lines -> {"power": ["line", "minor_line", "cable"]}
     bus stops -> {"highway": "bus_stop"}
     banks / ATMs -> {"amenity": ["bank", "atm"]}
     restaurants / cafes -> {"amenity": ["restaurant", "cafe", "fast_food"]}
@@ -68,8 +79,21 @@ Rules:
   "within 200 m of X" -> within 200; "near X" / "next to X" -> within 500;
   "more than 1 km from X" / "far from X" -> beyond (1000 / 1000). Convert km to metres.
   The main feature goes in osm_tags; the reference feature goes in target_osm_tags.
+  For water, use the MOST SPECIFIC type the user named; use the generic water set only
+  for "water" / "water bodies". "name~" is a list of case-insensitive name substrings,
+  an alternative (OR) to the other tags, for water types OSM has no tag for.
   Target examples:
-    water bodies / lakes / ponds / rivers / creeks ->
+    rivers -> {"waterway": "river", "water": "river"}
+    streams / nalas / nallahs / drains -> {"waterway": ["stream", "drain", "ditch"],
+                                           "water": ["stream", "drain"]}
+    canals -> {"waterway": "canal", "water": "canal"}
+    ponds / lakes / talaos / tanks / reservoirs ->
+      {"water": ["pond", "lake", "reservoir", "basin"],
+       "name~": ["talao", "talav", "pond", "lake", "tank"]}
+    creeks -> {"waterway": "tidal_channel", "name~": ["creek", "khadi"]}
+    sea / coast / bay / beach -> {"natural": ["coastline", "bay", "beach"]}
+    wetlands / mangroves -> {"natural": "wetland"}
+    water / water bodies (generic) ->
       {"natural": "water", "water": "*", "waterway": ["river", "stream", "canal", "dock"]}
     railway stations -> {"railway": ["station", "halt"], "station": ["!subway", "!monorail", "!light_rail"]}
     main roads -> {"highway": ["motorway", "trunk", "primary", "secondary"]}

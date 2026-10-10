@@ -16,6 +16,8 @@ def feature_label(f):
     name, btype, tag = f.get("name"), f.get("building"), f.get("matched_tag")
     if isinstance(name, str):
         return name
+    if isinstance(f.get("group_label"), str):   # merged unnamed pieces, e.g. "Unnamed rail (yard)"
+        return f["group_label"]
     if isinstance(tag, str) and "=" in tag and not tag.startswith("building="):
         return "Unnamed " + tag.split("=", 1)[1].replace("_", " ")
     if isinstance(btype, str) and btype != "yes":
