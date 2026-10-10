@@ -5,6 +5,7 @@ data/tiles/
 data/*.faiss
 data/*.gpkg
 data/tile_index.json
+data/*.npy
 __pycache__/
 *.pyc
 *.pth

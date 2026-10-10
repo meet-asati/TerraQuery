@@ -1,11 +1,13 @@
+import math
 import threading
 import faiss
 import numpy as np
+import pandas as pd
 import json
 import geopandas as gpd
 import torch
 import open_clip
-from shapely.geometry import box as shapely_box
+from shapely.geometry import Point, box as shapely_box
 from config import *
 from parser import parse_query
 
@@ -44,10 +46,27 @@ def _load_models():
         _faiss_index = faiss.read_index(FAISS_INDEX)
     _load_buildings()  # slow first read (~1 min); do it at startup, not on first query
     _load_roads()
+    _load_pois()
+    _load_landcover()
+    _load_building_index()
     print("Models loaded." if _model is not None else "Running without SkyCLIP model.")
 
 _buildings = None
 _roads = None
+_pois = None
+CATEGORY_LIMIT = 50          # max features listed for a category query ("hospitals")
+QUALIFIER_KEYS = {"religion", "denomination", "sport", "cuisine", "operator", "station"}
+METRIC_CRS = "EPSG:32643"     # UTM 43N (Mumbai): distances in metres
+DEFAULT_NEAR_M = 500
+_landcover = None
+# Per-building embeddings (build_building_index.py): FAISS index, embedding->building row,
+# building row->embedding, and the raw normalized vectors for whole-area statistics
+_bld_index = _bld_rows = _row_to_emb = _bld_emb = None
+# OSM name variants searched for named queries (excludes e.g. name:etymology:wikidata)
+NAME_COLS = ("name", "name:en", "alt_name", "short_name", "official_name",
+             "old_name", "int_name", "loc_name", "addr:housename")
+_NAME_STOPWORDS = {"the", "of", "and", "college", "school", "road", "marg", "station",
+                   "building", "near", "mumbai"}
 MAJOR_ROADS = ("motorway", "trunk", "primary", "secondary")
 
 def _load_roads() -> gpd.GeoDataFrame:
@@ -64,6 +83,362 @@ def _load_roads() -> gpd.GeoDataFrame:
             return gpd.GeoDataFrame()
     return _roads
 
+def _load_pois() -> gpd.GeoDataFrame:
+    global _pois
+    if _pois is None:
+        try:
+            p = gpd.read_file(OSM_POIS)
+            _pois = p.set_crs("EPSG:4326") if p.crs is None else p.to_crs("EPSG:4326")
+            _pois.sindex
+        except Exception as e:
+            print(f"[WARNING] Could not load OSM POIs from {OSM_POIS} ({e}) - run "
+                  "`python -c \"from indexer import download_osm_pois; download_osm_pois()\"`")
+            return gpd.GeoDataFrame()
+    return _pois
+
+def _as_list(v):
+    return v if isinstance(v, (list, tuple, set)) else [v]
+
+def _tag_match(gdf: gpd.GeoDataFrame, tags: dict):
+    """OSM tag match. Primary keys are alternatives (OR); qualifier keys (religion...) narrow
+    them. Returns (mask, matched_tag) where matched_tag is e.g. 'amenity=hospital'."""
+    mask = pd.Series(False, index=gdf.index)
+    matched = pd.Series("", index=gdf.index, dtype="object")
+    by_building = pd.Series(False, index=gdf.index)
+    for k, v in tags.items():
+        if k in QUALIFIER_KEYS or k not in gdf.columns:
+            continue
+        col = gdf[k]
+        hit = col.notna() if any(x in ("*", "yes", True) for x in _as_list(v)) \
+            else col.isin([str(x) for x in _as_list(v)])
+        new = hit & ~mask
+        matched[new] = k + "=" + col[new].astype(str)
+        if k == "building":
+            by_building |= new
+        mask |= hit
+    for k, v in tags.items():
+        if k not in QUALIFIER_KEYS:
+            continue
+        col = gdf[k] if k in gdf.columns else pd.Series(None, index=gdf.index, dtype="object")
+        vals = [str(x) for x in _as_list(v)]
+        excl = [x[1:] for x in vals if x.startswith("!")]
+        incl = [x for x in vals if not x.startswith("!")]
+        if incl:   # e.g. religion=hindu (untagged rows pass only if matched via building=temple)
+            mask &= col.isin(incl) | (col.isna() & by_building)
+        if excl:   # e.g. station=!subway: metro/monorail stops are not railway stations
+            mask &= ~col.isin(excl)
+    return mask, matched
+
+def _dedupe(results: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Same named place mapped twice (POI node + building polygon): keep the polygon."""
+    if results.empty or "name" not in results.columns:
+        return results
+    cen = results.geometry.representative_point()
+    key = results["name"].astype("string").str.lower().str.strip() + "|" + \
+        cen.x.round(3).astype(str) + "|" + cen.y.round(3).astype(str)
+    is_point = (results.geometry.geom_type == "Point").astype(int)
+    order = results.assign(_k=key.fillna(pd.Series(results.index.astype(str), index=results.index)),
+                           _p=is_point).sort_values("_p")
+    return order.drop_duplicates("_k").drop(columns=["_k", "_p"])
+
+def _dissolve_roads(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Merge road segments by name so 'main roads' lists roads, not hundreds of segments."""
+    lines = roads[roads.geometry.geom_type.isin(["LineString", "MultiLineString"])]
+    points = roads[~roads.index.isin(lines.index)]
+    named = lines[lines["name"].notna()] if "name" in lines.columns else lines.iloc[0:0]
+    if len(named):
+        agg = {c: "first" for c in ("highway", "matched_tag", "layer") if c in named.columns}
+        named = named.dissolve(by="name", aggfunc=agg, as_index=False)
+    merged = pd.concat([named, points], ignore_index=True)
+    merged = gpd.GeoDataFrame(merged, geometry="geometry", crs="EPSG:4326")
+    merged["_len"] = merged.to_crs(3857).length
+    merged["_named"] = merged["name"].notna() if "name" in merged.columns else False
+    return merged.sort_values(["_named", "_len"], ascending=False).drop(columns=["_len", "_named"])
+
+def _load_landcover() -> gpd.GeoDataFrame:
+    global _landcover
+    if _landcover is None:
+        try:
+            lc = gpd.read_file(OSM_LANDCOVER)
+            _landcover = lc.set_crs("EPSG:4326") if lc.crs is None else lc.to_crs("EPSG:4326")
+        except Exception as e:
+            print(f"[WARNING] Could not load land cover from {OSM_LANDCOVER} ({e}) - run "
+                  "`python -c \"from indexer import download_osm_landcover; download_osm_landcover()\"`")
+            return gpd.GeoDataFrame()
+    return _landcover
+
+def _find_targets(tags: dict) -> gpd.GeoDataFrame:
+    """Every OSM feature (any layer) carrying the target tags of a spatial relation."""
+    parts = []
+    for layer, gdf in (("building", _load_buildings()), ("poi", _load_pois()),
+                       ("road", _load_roads()), ("landcover", _load_landcover())):
+        if gdf.empty:
+            continue
+        mask, matched = _tag_match(gdf, tags)
+        if mask.any():
+            hit = gdf.loc[mask, ["geometry"]].copy()
+            hit["target_name"] = gdf.loc[mask, "name"] if "name" in gdf.columns else None
+            hit["target_tag"] = matched[mask]
+            parts.append(hit)
+    if not parts:
+        return gpd.GeoDataFrame(columns=["geometry", "target_name", "target_tag"],
+                                geometry="geometry", crs="EPSG:4326")
+    return gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry",
+                            crs="EPSG:4326")
+
+def _spatial_relation(parsed: dict):
+    rel = parsed.get("spatial_relation")
+    if not isinstance(rel, dict) or not rel.get("target_osm_tags"):
+        return None
+    try:
+        dist = float(rel.get("distance_m") or DEFAULT_NEAR_M)
+    except (TypeError, ValueError):
+        dist = DEFAULT_NEAR_M
+    return {"type": "beyond" if rel.get("type") in ("beyond", "far", "far_from") else "within",
+            "distance_m": dist, "tags": rel["target_osm_tags"],
+            "label": rel.get("target") or "the target features"}
+
+def _apply_spatial(results: gpd.GeoDataFrame, rel: dict):
+    """Keep results within / beyond rel['distance_m'] of the target features (metres, UTM).
+    Adds dist_m, target_name, target_tag. Returns (filtered, note, targets_used)."""
+    targets = _find_targets(rel["tags"])
+    label, dist = rel["label"], rel["distance_m"]
+    if targets.empty:
+        return results.iloc[0:0], f"No {label} found in the OpenStreetMap data, so nothing " \
+            f"can be within {dist:.0f} m of them.", targets
+    if results.empty:
+        return results, "", targets.iloc[0:0]
+    r_m = results[["geometry"]].to_crs(METRIC_CRS)
+    t_m = targets.to_crs(METRIC_CRS)
+    near = gpd.sjoin_nearest(r_m, t_m, how="left", distance_col="dist_m")
+    near = near[~near.index.duplicated(keep="first")]          # equidistant ties
+    keep = near["dist_m"] <= dist if rel["type"] == "within" else near["dist_m"] > dist
+    out = results.loc[near.index[keep]].copy()
+    out["dist_m"] = near.loc[keep, "dist_m"].round().astype(int).values
+    out["target_name"] = near.loc[keep, "target_name"].values
+    out["target_tag"] = near.loc[keep, "target_tag"].values
+    rel_txt = f"within {dist:.0f} m of" if rel["type"] == "within" else f"more than {dist:.0f} m from"
+    note = (f"{len(out)} of {len(results)} {rel_txt} {label}" if len(out) else
+            f"None of the {len(results)} matching features is {rel_txt} {label}.")
+    used = targets.loc[sorted(set(near.loc[keep, "index_right"].dropna().astype(int)))]
+    return out, note, used
+
+def _spatial_text(f) -> str:
+    if pd.isna(f.get("dist_m")):
+        return ""
+    tgt = f.get("target_name") if isinstance(f.get("target_name"), str) else None
+    what = f"'{tgt}' ({f.get('target_tag')})" if tgt else f"a feature tagged {f.get('target_tag')}"
+    return f"{int(f['dist_m'])} m from {what}"
+
+def osm_category_search(user_query, parsed, text_feat, tile_scores, top_k=CATEGORY_LIMIT):
+    """Category query ("hospitals", "parks", "main roads"): every OSM feature carrying the
+    tags, with exact geometry and names. Imagery similarity only orders the results."""
+    tags = parsed.get("osm_tags") or {}
+    is_road = any(k == "highway" for k in tags)
+    parts = []
+    layers = (("road", _load_roads()),) if is_road else \
+        (("building", _load_buildings()), ("poi", _load_pois()))
+    for layer, gdf in layers:
+        if gdf.empty:
+            continue
+        mask, matched = _tag_match(gdf, tags)
+        if mask.any():
+            hit = gdf[mask].copy()
+            hit["matched_tag"] = matched[mask]
+            hit["layer"] = layer
+            if layer == "building" and _bld_index is not None:
+                hit["score"] = _bld_emb[_row_to_emb[hit.index]] @ text_feat[0]
+            parts.append(hit)
+    if not parts:
+        empty = gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs="EPSG:4326")
+        empty.attrs["no_tag_match"] = True
+        return empty
+    results = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry",
+                               crs="EPSG:4326")
+    rel = _spatial_relation(parsed)
+    if is_road:
+        results = _dissolve_roads(results)
+    else:
+        results = _dedupe(results)
+        # Points/POIs without a crop embedding: use the score of the tile they sit in
+        cen = results.geometry.representative_point()
+        tile_s = pd.Series([tile_scores.get(_tile_id_at(c.x, c.y), np.nan) for c in cen],
+                           index=results.index)
+        results["score"] = results["score"].fillna(tile_s) if "score" in results.columns else tile_s
+        results = results.assign(_named=results["name"].notna()).sort_values(
+            ["_named", "score"], ascending=[False, False]).drop(columns="_named")
+    note, targets = "", None
+    if rel:
+        results, note, targets = _apply_spatial(results, rel)
+        results = results.sort_values("dist_m", ascending=rel["type"] == "within", kind="stable")
+    total = len(results)
+    results = results.head(top_k).copy()
+    if results.empty:
+        results.attrs["note"] = note
+        return results
+
+    roads = _load_roads()
+    reasons, facts = [], []
+    for _, f in results.iterrows():
+        tag = f.get("matched_tag") or ""
+        name = f.get("name") if isinstance(f.get("name"), str) else None
+        sp = _spatial_text(f) if rel else ""
+        reasons.append(f"Tagged {tag} in OpenStreetMap" + (f" as '{name}'" if name else "")
+                       + (f", {sp}" if sp else "") + f", which matches '{user_query}'.")
+        bits = [f"OSM tag {tag}", f"{f.geometry.geom_type.lower()} from the {f.get('layer')} layer"]
+        if sp:
+            bits.append(sp)
+        if not is_road and not roads.empty:
+            near = roads.iloc[roads.sindex.query(f.geometry.buffer(0.0015), predicate="intersects")]
+            major = near[near["highway"].isin(MAJOR_ROADS)]
+            rn = ", ".join(major["name"].dropna().astype(str).unique()[:2])
+            if rn:
+                bits.append(f"near {rn}")
+        if pd.notna(f.get("score")):
+            bits.append(f"imagery similarity {float(f['score']):.3f}")
+        facts.append("; ".join(bits) + ".")
+    results["rank"] = range(1, len(results) + 1)
+    results["reason"] = reasons
+    results["facts"] = facts
+    results["source"] = "osm_tags"
+    results["total_matches"] = total
+    if "score" not in results.columns:
+        results["score"] = np.nan
+    results.attrs["note"] = note
+    if targets is not None and len(targets):
+        results.attrs["targets"] = targets   # popped by the UI to draw the target features
+    return results
+
+def _load_building_index():
+    global _bld_index, _bld_rows, _row_to_emb, _bld_emb
+    if _bld_index is not None:
+        return
+    try:
+        index, rows = faiss.read_index(BUILDING_FAISS), np.load(BUILDING_ROWS)
+        n_buildings = len(_load_buildings())
+        if len(rows) != index.ntotal or (len(rows) and rows.max() >= n_buildings):
+            raise ValueError("out of date with the OSM buildings file")
+        row_to_emb = np.full(n_buildings, -1, dtype="int64")
+        row_to_emb[rows] = np.arange(len(rows))
+        _bld_emb = index.reconstruct_n(0, index.ntotal)
+        _bld_index, _bld_rows, _row_to_emb = index, rows, row_to_emb
+    except Exception as e:
+        print(f"[WARNING] Per-building index unavailable ({e}) - run build_building_index.py; "
+              "falling back to tile-level results")
+
+def _tile_id_at(lon: float, lat: float) -> str:
+    n = 2 ** ZOOM_LEVEL
+    x = int((lon + 180) / 360 * n)
+    lat_r = math.radians(lat)
+    y = int((1 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n)
+    return f"tile_{ZOOM_LEVEL}_{x}_{y}"
+
+def _feature_search(user_query, parsed, text_feat, feats, top_k, tile_rank):
+    """Rank individual OSM buildings by their own image-crop similarity to the query.
+    Returns one row per matched building (exact OSM footprint) with explanation facts."""
+    buildings, roads = _load_buildings(), _load_roads()
+    combined = _bld_emb @ text_feat[0]                       # similarity of every building
+    order = np.argsort(-combined)
+    global_rank = np.empty(len(order), dtype="int64")
+    global_rank[order] = np.arange(1, len(order) + 1)
+    z_all = (combined - combined.mean()) / (combined.std() + 1e-9)
+    if feats is not None:                                    # which prompt drove the match
+        sims = _bld_emb @ feats.T
+        z_prompt = (sims - sims.mean(axis=0)) / (sims.std(axis=0) + 1e-9)
+
+    # Candidates in similarity order, then a soft tag filter (never empties the result)
+    rel = _spatial_relation(parsed)
+    cand = buildings.iloc[_bld_rows[order[:3000 if rel else max(top_k * 50, 500)]]]
+    filter_note = ""
+    tags = {k: v for k, v in (parsed.get("osm_tags") or {}).items()
+            if not (k == "building" and v in ("yes", True))}
+    if tags:
+        mask, _ = _tag_match(cand, tags)
+        if mask.any():
+            cand = cand[mask]
+        else:
+            filter_note = f"OSM filter {tags} matched nothing among the visual matches and was ignored"
+    targets = None
+    if rel:
+        cand, sp_note, targets = _apply_spatial(cand, rel)   # keeps similarity order
+        filter_note = "; ".join(x for x in (filter_note, sp_note) if x)
+    results = cand.head(top_k).copy()
+
+    desc = parsed.get("visual_description") or user_query
+    n, n_tiles = len(order), len(tile_rank)
+    cols = {k: [] for k in ("rank", "score", "global_rank", "area_rank", "matched_on", "roads", "facts")}
+    for rank, (pos, geom) in enumerate(zip(results.index, results.geometry), start=1):
+        e = _row_to_emb[pos]
+        g_rank, zc = int(global_rank[e]), float(z_all[e])
+        strength = "very strongly" if zc >= 3.5 else "strongly" if zc >= 2.5 else "moderately"
+        if feats is not None:
+            matched_on = (f"your wording '{user_query}'" if z_prompt[e, 0] >= z_prompt[e, 1]
+                          else f"the visual cue '{_short(desc)}'")
+        else:
+            matched_on = "n/a (model unavailable)"
+        c = geom.centroid
+        a_rank = tile_rank.get(_tile_id_at(c.x, c.y))
+        near = roads.iloc[roads.sindex.query(geom.buffer(0.0015), predicate="intersects")] \
+            if not roads.empty else roads
+        major = near[near["highway"].isin(MAJOR_ROADS)] if "highway" in near.columns else near
+        road_names = ", ".join(major["name"].dropna().astype(str).unique()[:2]) \
+            if "name" in major.columns else ""
+        btype = results.at[pos, "building"] if "building" in results.columns else None
+        bname = results.at[pos, "name"] if "name" in results.columns else None
+        what = (f"OSM {btype} building" if isinstance(btype, str) and btype != "yes"
+                else "OSM building") + (f" '{bname}'" if isinstance(bname, str) else "")
+        pct = g_rank / n * 100
+        parts = [f"Ranked #{g_rank} of {n:,} buildings (top {pct:.2f}%)" if pct < 1 else
+                 f"Ranked #{g_rank} of {n:,} buildings (top {pct:.1f}%)",
+                 f"its roof imagery matches {strength}, mainly on {matched_on}", what]
+        if a_rank:
+            parts.append(f"surrounding 250 m area ranks #{a_rank} of {n_tiles} for this query")
+        if road_names:
+            parts.append(f"near {road_names}")
+        if rel:
+            sp = _spatial_text(results.loc[pos])
+            if sp:
+                parts.append(sp)
+        cols["rank"].append(rank)
+        cols["score"].append(round(float(combined[e]), 4))
+        cols["global_rank"].append(g_rank)
+        cols["area_rank"].append(a_rank)
+        cols["matched_on"].append(matched_on)
+        cols["roads"].append(road_names)
+        cols["facts"].append("; ".join(parts) + ".")
+    for k, v in cols.items():
+        results[k] = v
+    results["source"] = "clip_osm"
+    results["filter_note"] = filter_note
+    results.attrs["note"] = filter_note
+    if targets is not None and len(targets):
+        results.attrs["targets"] = targets
+    return results
+
+def _gap_detection(D_all, I_all, tiles, top_k):
+    """Tile centres (Points) among the best visual matches that contain no OSM building."""
+    buildings = _load_buildings()
+    n_tiles, records = len(D_all[0]), []
+    for rank, (i, score) in enumerate(zip(I_all[0][:top_k * 2], D_all[0][:top_k * 2]), start=1):
+        if not 0 <= i < len(tiles):
+            continue
+        minx, miny, maxx, maxy = tiles[i]["bbox"]
+        if len(buildings) and len(buildings.sindex.query(shapely_box(minx, miny, maxx, maxy),
+                                                         predicate="intersects")):
+            continue
+        records.append({"geometry": Point((minx + maxx) / 2, (miny + maxy) / 2),
+                        "tile_id": tiles[i]["tile_id"], "score": round(float(score), 4),
+                        "area_rank": rank, "source": "gap_detection",
+                        "facts": f"Area ranked #{rank} of {n_tiles} visually matches the query "
+                                 "but has no building mapped in OpenStreetMap."})
+    if records:
+        gaps = gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+    else:
+        gaps = gpd.GeoDataFrame(columns=["geometry", "score", "source", "facts"],
+                                geometry="geometry", crs="EPSG:4326")
+    gaps["rank"] = range(1, len(gaps) + 1)
+    return gaps
+
 def _load_buildings() -> gpd.GeoDataFrame:
     global _buildings
     if _buildings is None:
@@ -71,8 +446,9 @@ def _load_buildings() -> gpd.GeoDataFrame:
             b = gpd.read_file(OSM_BUILDINGS)
             b = b.set_crs("EPSG:4326") if b.crs is None else b.to_crs("EPSG:4326")
             # Keep only useful columns; the raw OSM export has ~180 sparse tag columns
-            keep = [c for c in ("building", "name", "amenity", "landuse", "power",
-                                "solar_panel", "geometry") if c in b.columns]
+            keep = [c for c in ("building", "amenity", "healthcare", "leisure", "religion", "shop",
+                                "tourism", "office", "landuse", "power", "solar_panel",
+                                *NAME_COLS, "geometry") if c in b.columns]
             _buildings = b[keep]
             _buildings.sindex  # build spatial index once
         except Exception as e:
@@ -142,13 +518,76 @@ def _add_tile_facts(tile_polys, top_idx, feats, user_query, parsed, n_total):
     for k, v in rows.items():
         tile_polys[k] = v
 
+def _name_match(gdf: gpd.GeoDataFrame, name_filter: str) -> gpd.GeoDataFrame:
+    """Case-insensitive match of name_filter against OSM name columns.
+    Pass 1: whole name as substring. Pass 2: every significant word present.
+    Adds `matched_field` / `matched_name` columns for explanations."""
+    cols = [c for c in NAME_COLS if c in gdf.columns]
+    if gdf.empty or not cols or not name_filter.strip():
+        return gdf.iloc[0:0]
+    names = gdf[cols].astype("string")
+    needle = name_filter.strip().lower()
+    words = [w for w in needle.replace(".", " ").split() if len(w) > 2 and w not in _NAME_STOPWORDS]
+    for test in (lambda col: col.str.lower().str.contains(needle, regex=False, na=False),
+                 lambda col: col.str.lower().apply(
+                     lambda v: bool(words) and isinstance(v, str) and all(w in v for w in words))):
+        hits = names.apply(test)
+        mask = hits.any(axis=1)
+        if mask.any():
+            out = gdf[mask].copy()
+            field = hits[mask].idxmax(axis=1)  # first matching column per row
+            out["matched_field"] = field.values
+            out["matched_name"] = [names.loc[i, f] for i, f in zip(out.index, field)]
+            return out
+    return gdf.iloc[0:0]
+
+def osm_direct_search(parsed: dict) -> gpd.GeoDataFrame:
+    """Rule-based OSM search for a specifically named feature: exact OSM geometries,
+    no CLIP and no tiles. Returns an empty frame if the name isn't in the data
+    (never falls back to all features)."""
+    name_filter = parsed.get("name_filter") or ""
+    parts = []
+    for layer, gdf in (("building", _load_buildings()), ("poi", _load_pois()),
+                       ("road", _load_roads())):
+        hit = _name_match(gdf, name_filter)
+        if not hit.empty:
+            hit["layer"] = layer
+            parts.append(hit)
+    if not parts:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs="EPSG:4326")
+    results = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry",
+                               crs="EPSG:4326")
+    # Tag filters only narrow the match (name is the precise selector); never empty it
+    tags = {k: v for k, v in (parsed.get("osm_tags") or {}).items()
+            if not (k == "building" and v in ("yes", True))}
+    if tags:
+        mask, _ = _tag_match(results, tags)
+        if mask.any():
+            results = results[mask]
+    roads_hit = results[results["layer"] == "road"]
+    if len(roads_hit) > 1 and "matched_name" in roads_hit.columns:
+        lines = roads_hit[roads_hit.geometry.geom_type.isin(["LineString", "MultiLineString"])]
+        if len(lines):
+            merged = lines.dissolve(by="matched_name", aggfunc="first", as_index=False)
+            results = gpd.GeoDataFrame(pd.concat([results[results["layer"] != "road"], merged],
+                                                 ignore_index=True), geometry="geometry", crs="EPSG:4326")
+    results = _dedupe(results) if "name" in results.columns else results
+    results["score"] = 1.0  # rule-based = full confidence
+    results["source"] = "osm_direct"
+    return results
+
 def query_pipeline(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict = None) -> gpd.GeoDataFrame:
     return search_with_tiles(user_query, top_k, parsed)[0]
 
 def search_with_tiles(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict = None):
-    """Returns (results, ranked matched tiles)."""
+    """Returns (results, tiles). results are exact OSM features (or gap points); tiles is only
+    filled by the tile-level fallback used when the per-building index is missing."""
     if parsed is None:
         parsed = parse_query(user_query)
+
+    # Route: a specifically named feature goes straight to OSM; tiles play no part
+    if parsed.get("name_filter"):
+        return osm_direct_search(parsed), gpd.GeoDataFrame()
 
     # Encode text
     feats = None
@@ -182,6 +621,29 @@ def search_with_tiles(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict 
         print("[WARNING] Tile index not found")
         tiles = []
 
+    # Feature-level routes: tiles only confirm the appearance; geometry comes from OSM
+    tile_rank = {tiles[i]["tile_id"]: r for r, i in enumerate(I_all[0], start=1)
+                 if 0 <= i < len(tiles)}
+    if parsed.get("task") == "gap_detection":
+        return _gap_detection(D_all, I_all, tiles, top_k), gpd.GeoDataFrame()
+
+    tags = {k: v for k, v in (parsed.get("osm_tags") or {}).items()
+            if not (k == "building" and v in ("yes", True))}     # building=yes = no category
+    if not tags and parsed.get("feature_type") == "road":
+        tags = {"highway": "*"}
+    if tags:
+        tile_scores = {tiles[i]["tile_id"]: float(d) for d, i in zip(D_all[0], I_all[0])
+                       if 0 <= i < len(tiles)}
+        found = osm_category_search(user_query, {**parsed, "osm_tags": tags}, text_feat,
+                                    tile_scores)
+        if not found.attrs.get("no_tag_match"):
+            return found, gpd.GeoDataFrame()     # may be empty after a spatial filter: say so
+        print(f"[pipeline] no OSM features tagged {tags}; falling back to visual search")
+    if _bld_index is not None:
+        return (_feature_search(user_query, parsed, text_feat, feats, top_k, tile_rank),
+                gpd.GeoDataFrame())
+
+    # Fallback (no per-building index): tile-level matches and the buildings inside them
     top_idx = [i for i in I[0] if 0 <= i < len(tiles)]
     top_tiles = [tiles[i] for i in top_idx]
     scores = D[0][:len(top_tiles)].tolist()
@@ -220,6 +682,8 @@ def search_with_tiles(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict 
         results = tile_polys  # fallback: return tile matches
     else:
         results = gpd.sjoin(buildings, tile_polys, how="inner", predicate="intersects")
+        # Tiles are only a lookup index: keep the OSM footprint (left side) as the geometry
+        results = results.drop(columns=["index_right"], errors="ignore").set_geometry("geometry")
         results = results.sort_values("score", ascending=False)
 
     # Ranked matched tiles, for the UI to highlight what the visual search actually found
@@ -228,15 +692,19 @@ def search_with_tiles(user_query: str, top_k: int = TOP_K_DEFAULT, parsed: dict 
     return results, tile_polys
 
 def get_output_formats(results: gpd.GeoDataFrame) -> dict:
+    # OSM features may be Points (nodes) or Polygons/Lines (ways/relations)
     if results.empty:
         return {"geojson": "{}", "centroids": [], "bboxes": [], "count": 0}
-        
-    return {
-        "geojson": results.to_json(),
-        "centroids": [[r.geometry.centroid.y, r.geometry.centroid.x]
-                      for _, r in results.iterrows()],
-        "bboxes": [list(r.geometry.bounds) for _, r in results.iterrows()],
-        "count": len(results)
-    }
+    centroids, bboxes = [], []
+    for geom in results.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        c = geom.centroid
+        centroids.append([round(c.y, 6), round(c.x, 6)])
+        bboxes.append([round(v, 6) for v in geom.bounds])
+    return {"geojson": results.to_json(), "centroids": centroids,
+            "bboxes": bboxes, "count": len(results)}
 
-__all__ = ["load_models", "query_pipeline", "search_with_tiles", "get_output_formats"]
+__all__ = ["load_models", "query_pipeline", "search_with_tiles", "osm_direct_search",
+           "osm_category_search",
+           "get_output_formats"]

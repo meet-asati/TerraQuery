@@ -123,6 +123,56 @@ def download_osm_data(bbox=AOI_BBOX):
     buildings.to_file(OSM_BUILDINGS, driver="GPKG")
     roads.to_file(OSM_ROADS, driver="GPKG")
     print(f"Downloaded {len(buildings)} buildings and {len(roads)} roads")
+    download_osm_pois(bbox)
+
+# Points of interest that are often mapped without a building tag (hospital nodes, stations, parks...)
+POI_TAGS = {"amenity": True, "healthcare": True, "leisure": True, "tourism": True, "shop": True,
+            "office": True, "historic": True, "railway": ["station", "halt"],
+            "public_transport": "station"}
+POI_COLUMNS = ("name", "name:en", "alt_name", "short_name", "official_name", "old_name",
+               "amenity", "healthcare", "leisure", "tourism", "shop", "office", "historic",
+               "railway", "public_transport", "religion", "building", "sport", "operator",
+               # station type: separates suburban/main-line trains from metro and monorail
+               "station", "train", "subway", "monorail", "light_rail", "network", "usage")
+
+def download_osm_pois(bbox=AOI_BBOX):
+    for endpoint in OVERPASS_ENDPOINTS:
+        ox.settings.overpass_endpoint = endpoint
+        try:
+            pois = ox.features_from_bbox(*bbox, tags=POI_TAGS)
+            break
+        except Exception as e:
+            print(f"[WARNING] Overpass endpoint {endpoint} failed for POIs: {e}")
+    else:
+        print("[WARNING] POI download failed — keeping existing POI data (if any)")
+        return
+    pois = pois.reset_index()  # element_type / osmid become columns
+    keep = [c for c in ("element_type", "osmid", *POI_COLUMNS) if c in pois.columns]
+    pois = gpd.GeoDataFrame(pois[keep + ["geometry"]], geometry="geometry", crs=pois.crs)
+    pois.to_file(OSM_POIS, driver="GPKG")
+    print(f"Downloaded {len(pois)} points of interest")
+    download_osm_landcover(bbox)
+
+# Water bodies and land cover, used as spatial-relation targets ("within 200 m of water bodies")
+LANDCOVER_TAGS = {"natural": True, "waterway": True, "water": True, "landuse": True}
+LANDCOVER_COLUMNS = ("name", "name:en", "natural", "waterway", "water", "landuse", "leisure")
+
+def download_osm_landcover(bbox=AOI_BBOX):
+    for endpoint in OVERPASS_ENDPOINTS:
+        ox.settings.overpass_endpoint = endpoint
+        try:
+            lc = ox.features_from_bbox(*bbox, tags=LANDCOVER_TAGS)
+            break
+        except Exception as e:
+            print(f"[WARNING] Overpass endpoint {endpoint} failed for land cover: {e}")
+    else:
+        print("[WARNING] Land-cover download failed — keeping existing data (if any)")
+        return
+    lc = lc.reset_index()
+    keep = [c for c in ("element_type", "osmid", *LANDCOVER_COLUMNS) if c in lc.columns]
+    lc = gpd.GeoDataFrame(lc[keep + ["geometry"]], geometry="geometry", crs=lc.crs)
+    lc.to_file(OSM_LANDCOVER, driver="GPKG")
+    print(f"Downloaded {len(lc)} land-cover / water features")
 
 def demo_mode():
     os.makedirs(TILE_DIR, exist_ok=True)

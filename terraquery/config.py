@@ -31,6 +31,11 @@ TILE_INDEX = "data/tile_index.json"
 FAISS_INDEX = "data/skyclip_tile.faiss"
 OSM_BUILDINGS = "data/osm_buildings.gpkg"
 OSM_ROADS = "data/osm_roads.gpkg"
+OSM_POIS = "data/osm_pois.gpkg"   # amenities, healthcare, stations, parks... (often not buildings)
+OSM_LANDCOVER = "data/osm_landcover.gpkg"   # water bodies, waterways, natural areas, land use
+# Per-building SkyCLIP embeddings (built by build_building_index.py); rows = positions in OSM_BUILDINGS
+BUILDING_FAISS = "data/skyclip_building.faiss"
+BUILDING_ROWS = "data/building_rows.npy"
 
 # OpenAI — loaded from .env, never hardcoded
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
